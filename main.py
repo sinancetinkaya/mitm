@@ -1,26 +1,18 @@
-"""
-mitmdump -p 8081 -s main.py
-"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" --proxy-server="localhost:8081"
+# mitmdump -p 8081 -s main.py
+# "C:\Users\sinan\AppData\Local\Chromium\Application\chrome.exe" --proxy-server="localhost:8081"
 
-"""
+import inspect
 import json
+import os
 import urllib.parse
-from mitmproxy import proxy, options
+from mitmproxy.http import HTTPFlow
+from mitmproxy.tools import main
 from mitmproxy.tools.dump import DumpMaster
 import logging
+import operator
 
 
-# import ptvsd
-
-# # Allow other computers to attach to ptvsd at this IP address and port.
-# ptvsd.enable_attach(address=('localhost', 5678), redirect_output=True)
-
-# # Pause the program until a remote debugger is attached
-# print("WAITING FOR DEBUG ATTACH")
-# ptvsd.wait_for_attach()
-
-# log_format = '%(levelname).1s,%(asctime)s,%(name)s,%(lineno)d: %(message)s'
-log_format = '%(message)s'
+log_format = '%(levelname).1s,%(asctime)s,%(name)s,%(lineno)d: %(message)s'
 logging.basicConfig(level=logging.DEBUG, format=log_format)
 log_formatter = logging.Formatter(log_format)
 
@@ -35,16 +27,17 @@ logging.getLogger("requests.packages.urllib3.connectionpool").setLevel(logging.W
 log = logging.getLogger(__name__)
 
 CONNECTION_LOGS = {}
+DOMAINS = ["api.plugshare.com"]
+FOLDER = os.path.join(".\\", DOMAINS[0])
 
 
 class AddHeader:
     def __init__(self):
-        self.domain = "freelancer"
         self.content_types = ['json', 'html']
         self.LOG_COUNTER = 0
 
     def response(self, flow):
-        if self.domain in flow.request.host:
+        if any(map(lambda domain: domain in flow.request.host, DOMAINS)):
             if 'content-type' in flow.response.headers:
                 for content_type in self.content_types:
                     if content_type in flow.response.headers['content-type']:
@@ -52,42 +45,96 @@ class AddHeader:
             else:
                 self.log_response(flow)
 
-    def log_response(self, flow):
+    def websocket_handshake(self, flow):
+        self.log_response(flow)
+
+    def websocket_start(self, flow):
+        self.log_response(flow)
+
+    def websocket_message(self, flow):
+        self.log_response(flow)
+
+    def log_response(self, flow: HTTPFlow):
         self.LOG_COUNTER += 1
 
-        CONNECTION_LOG = {
-            "url": flow.request.url
-        }
-        CONNECTION_LOGS[f"{self.LOG_COUNTER}-{flow.request.method}"] = CONNECTION_LOG
+        if isinstance(flow, HTTPFlow):
+            LOG_ENTRY = f"{self.LOG_COUNTER}-{flow.request.method}"
+            CONNECTION_LOG = {"url": flow.request.url}
+            methods = [
+                'request.headers',
+                'request.cookies',
+                'request.content',
+                'response.headers',
+                'response.cookies',
+                'response.content',
+            ]
+        elif flow.websocket:
+            fname = inspect.stack()[1].function
+            LOG_ENTRY = f"{self.LOG_COUNTER}-{fname.upper()}"
+            CONNECTION_LOG = {"url": flow.handshake_flow.request.url}
+            methods = [
+                'messages',
+                'request.headers',
+                'request.cookies',
+                'handshake_flow.request.headers',
+                'handshake_flow.request.cookies',
+            ]
+        else:
+            log.warning(f"unknown flow type: {type(flow)}")
+            return False
 
-        for method in ['request', 'response']:
-            obj = getattr(flow, method)
-
-            CONNECTION_LOG[method] = {}
-
-            for key in ['headers', 'cookies', 'content']:
-
-                if not hasattr(obj, key):
-                    continue
-
-                attribute = getattr(obj, key)
+        for method in methods:
+            try:
+                attribute = operator.attrgetter(method)(flow)
                 if attribute is None:
                     continue
+            except AttributeError:
+                continue
 
-                if key in ['headers', 'cookies']:
-                    output = dict(attribute)
+            if method.endswith('headers') or method.endswith('cookies'):
+                output = dict(attribute)
 
-                elif key == 'content':
-                    output = self.jsonify_content(attribute)
+            elif method.endswith('content'):
+                content = attribute.decode('utf-8')
 
+                if "<html" in content and "<body" in content:
+                    output_file = os.path.join(FOLDER, f"{LOG_ENTRY}.html")
+                    with open(output_file, mode='w', encoding='utf-8') as fp:
+                        fp.write(content)
+                    return output_file  # HTML content is not useful, trim it
                 else:
-                    output = str(attribute)
+                    content = urllib.parse.unquote(content)
+                    output = self.jsonify_content(content)
 
-                CONNECTION_LOG[method][key] = output
+            elif method.endswith('messages'):
+                output = []
 
-    def jsonify_content(self, attribute):
-        content = attribute.decode('utf-8')
-        content = urllib.parse.unquote(content)
+                if len(attribute):
+                    message = attribute[-1]
+
+                    if message.from_client:
+                        method = "message-SENT"
+                    else:
+                        method = "message-RECV"
+
+                    try:
+                        data = message.content.split('~', -1)[4]
+                    except IndexError:
+                        data = message.content
+
+                    try:
+                        output = self.jsonify_content(data)
+                    except json.JSONDecodeError:
+                        output = data
+
+            else:
+                output = str(attribute)
+
+            CONNECTION_LOG[method] = output
+
+        CONNECTION_LOGS[LOG_ENTRY] = CONNECTION_LOG
+
+    def jsonify_content(self, content):
 
         try:
             return json.loads(content)
@@ -99,33 +146,33 @@ class AddHeader:
         except:
             pass
 
-        if content.startswith('<'):
-            return content[:80]  # HTML content is not useful, trim it
-
         return content
 
 
 if __name__ == "__main__":
 
-    opts = options.Options(listen_host='127.0.0.1', listen_port=8081)
-    opts.add_option("body_size_limit", int, 0, "")
-    opts.add_option("keep_host_header", bool, True, "")    
+    if not os.path.exists(FOLDER):
+        os.makedirs(FOLDER)
 
-    pconf = proxy.config.ProxyConfig(opts)
+    options = main.options.Options(listen_host='127.0.0.1', listen_port=8081)
+    master = DumpMaster(options=options)
 
-    m = DumpMaster(None)
-    m.server = proxy.server.ProxyServer(pconf)
     # print(m.addons)
-    m.addons.add(AddHeader())
-    print(m.addons)
+    master.addons.add(AddHeader())
+    print(master.addons)
+
+
     # m.addons.add(core.Core())
 
     def get_json(obj):
         return json.dumps(obj, indent=4, default=lambda o: getattr(o, '__dict__', str(o)))
 
+
     try:
-        m.run()
+        master.run()
     except KeyboardInterrupt:
-        m.shutdown()
-        with open("CONNECTION_LOGS.json", mode="w") as fp:
+        master.shutdown()
+    finally:
+        output_file = os.path.join(FOLDER, "CONNECTION_DUMP.json")
+        with open(output_file, mode="w") as fp:
             fp.write(get_json(CONNECTION_LOGS))
